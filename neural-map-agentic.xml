@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""
+Advanced Distributed TensorFlow Neural Network Script
+
+This script represents the full mind map:
+   ┌────────────────────────────────────────────┐
+   │              [Main Execution]              │
+   └────────────────────────────────────────────┘
+           │
+           │   ┌─────────────────────────────────────────┐
+           │   │           [Data Generation]             │
+           │   └─────────────────────────────────────────┘
+           │                │
+           │                ▼
+           │         [Synthetic Dataset]
+           │                │
+           │                ▼
+           │        [tf.data.Dataset]
+           │                │
+           │                ▼
+           │ [Shuffling, Batching, Prefetching]
+           │                │
+           │                ▼
+           │[Distributed Dataset Preparation]  <-- Note this branch!
+           │                │
+           │
+           │    ┌─────────────────────────────────────────────┐
+           │    │     [Distributed Strategy Scope]          │
+           │    └─────────────────────────────────────────────┘
+           │                       │
+           │                       ▼
+           │           [ComplexModel Instantiation]
+           │                       │
+           │       ┌───────────┴───────────┐
+           │       │                       │
+           │[Input Dense Layer]   [Hidden Layers Array]
+           │       │                       │
+           │       ▼                       ▼
+           │    [Residual Blocks (Repeated)] <-- (ResidualBlock Layers)
+           │                       │
+           │                       ▼
+           │     [BatchNormalization & Dropout]
+           │                       │
+           │                       ▼
+           │      [Output Dense Layer (softmax)]
+           │                       │
+           │                       ▼
+           │              [Model Compilation]
+           │                       │
+           │            ┌──────────┴──────────┐
+           │            │                     │
+           │  [Optimizer, Loss, Metrics]  [Callbacks: TensorBoard, CustomLR]
+           │            │                     │
+           │            └──────────┬──────────┘
+           │                       │
+           │                       ▼
+           │                [Training Phase]
+           │                       │
+           │            ┌──────────┴─────────────┐
+           │            │                        │
+           │ [High-Level model.fit() with Distributed Dataset]
+           │            │    OR         [Custom Training Loop using tf.GradientTape]
+           │            └──────────┬─────────────┘
+           │                       │
+           │                       ▼
+           │              [Model Evaluation & Validation]
+           │                       │
+           │                       ▼
+           │              [Model Saving & Logging]
+           │                       │
+           │                       ▼
+           │              [Post-Training Analysis]
+           │          ┌──────────────────────────────┐
+           │          │                              │
+           │ [Deployment: Export as SavedModel]   [Deployment: Convert to TF Lite/ONNX]
+           │          │                              │
+           │          └──────────────┬───────────────┘
+           │                         │
+           │                         ▼
+           └──────────>[Further Analysis & Debugging Tools]
+           
+This script follows that entire pipeline!
+"""
+
+import os
+import datetime
+import numpy as np
+import tensorflow as tf
+
+# Suppress excessive TensorFlow logs (DEBUG/INFO)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# -----------------------------------------------------------------------------
+# Custom Layer Definitions
+# -----------------------------------------------------------------------------
+
+from tensorflow.keras import layers, models, regularizers, initializers, activations
+
+class CustomDense(layers.Layer):
+    """
+    A fully-connected layer with custom activation, bias, initializer, and regularizer.
+    """
+    def __init__(self,
+                 units,
+                 activation=None,
+                 use_bias=True,
+                 kernel_initializer='glorot_uniform',
+                 bias_initializer='zeros',
+                 kernel_regularizer=None,
+                 bias_regularizer=None,
+                 **kwargs):
+        super(CustomDense, self).__init__(**kwargs)
+        self.units = units
+        self.activation = activations.get(activation)
+        self.use_bias = use_bias
+        self.kernel_initializer = initializers.get(kernel_initializer)
+        self.bias_initializer = initializers.get(bias_initializer)
+        self.kernel_regularizer = regularizers.get(kernel_regularizer)
+        self.bias_regularizer = regularizers.get(bias_regularizer)
+
+    def build(self, input_shape):
+        last_dim = int(input_shape[-1])
+        self.kernel = self.add_weight(
+            name='kernel',
+            shape=(last_dim, self.units),
+            initializer=self.kernel_initializer,
+            regularizer=self.kernel_regularizer,
+            trainable=True)
+        if self.use_bias:
+            self.bias = self.add_weight(
+                name='bias',
+                shape=(self.units,),
+                initializer=self.bias_initializer,
+                regularizer=self.bias_regularizer,
+                trainable=True)
+        else:
+            self.bias = None
+        super(CustomDense, self).build(input_shape)
+
+    def call(self, inputs):
+        x = tf.matmul(inputs, self.kernel)
+        if self.use_bias:
+            x = tf.add(x, self.bias)
+        if self.activation:
+            x = self.activation(x)
+        return x
+
+    def get_config(self):
+        config = super(CustomDense, self).get_config()
+        config.update({
+            "units": self.units,
+            "activation": activations.serialize(self.activation),
+            "use_bias": self.use_bias,
+            "kernel_initializer": initializers.serialize(self.kernel_initializer),
+            "bias_initializer": initializers.serialize(self.bias_initializer),
+            "kernel_regularizer": regularizers.serialize(self.kernel_regularizer),
+            "bias_regularizer": regularizers.serialize(self.bias_regularizer),
+        })
+        return config
+
+class ResidualBlock(layers.Layer):
+    """
+    A residual block that stacks two CustomDense layers with a skip connection.
+    """
+    def __init__(self, units, activation='relu', **kwargs):
+        super(ResidualBlock, self).__init__(**kwargs)
+        self.units = units
+        self.activation = activation
+        self.dense1 = CustomDense(units,
+                                  activation=self.activation,
+                                  kernel_regularizer=regularizers.l2(1e-4))
+        self.dense2 = CustomDense(units,
+                                  activation=None,
+                                  kernel_regularizer=regularizers.l2(1e-4))
+        self.act_layer = layers.Activation(self.activation)
+
+    def call(self, inputs):
+        shortcut = inputs
+        x = self.dense1(inputs)
+        x = self.dense2(x)
+        x = layers.add([x, shortcut])  # Skip connection
+        x = self.act_layer(x)
+        return x
+
+    def get_config(self):
+        config = super(ResidualBlock, self).get_config()
+        config.update({
+            "units": self.units,
+            "activation": self.activation,
+        })
+        return config
+
+# -----------------------------------------------------------------------------
+# Complex Model Definition
+# -----------------------------------------------------------------------------
+
+class ComplexModel(tf.keras.Model):
+    """
+    A model that integrates the Input Dense layer, multiple hidden layers,
+    residual blocks, batch normalization, dropout, and a final output layer.
+    """
+    def __init__(self,
+                 input_dim,
+                 output_dim,
+                 hidden_units=[128, 256, 128],
+                 num_residual_blocks=3,
+                 dropout_rate=0.25,
+                 **kwargs):
+        super(ComplexModel, self).__init__(**kwargs)
+        # Input layer
+        self.input_dense = CustomDense(hidden_units[0],
+                                       activation='relu',
+                                       kernel_regularizer=regularizers.l2(1e-4))
+        # Additional hidden dense layers
+        self.hidden_layers = []
+        for units in hidden_units[1:]:
+            self.hidden_layers.append(
+                CustomDense(units,
+                            activation='relu',
+                            kernel_regularizer=regularizers.l2(1e-4))
+            )
+        # Residual blocks branch
+        self.residual_blocks = []
+        for _ in range(num_residual_blocks):
+            self.residual_blocks.append(
+                ResidualBlock(hidden_units[-1], activation='relu')
+            )
+        # Batch normalization and dropout after residual branch
+        self.batch_norm = layers.BatchNormalization()
+        self.dropout = layers.Dropout(dropout_rate)
+        # Output layer (softmax activation for classification)
+        self.output_dense = CustomDense(output_dim,
+                                        activation='softmax',
+                                        kernel_regularizer=regularizers.l2(1e-4))
+    
+    def call(self, inputs, training=False):
+        # [Input Dense Layer]
+        x = self.input_dense(inputs)
+        # [Hidden Layers Array]
+        for layer in self.hidden_layers:
+            x = layer(x)
+        # [Residual Blocks (Repeated)]
+        for block in self.residual_blocks:
+            x = block(x)
+        # [Batch Norm & Dropout Layers]
+        x = self.batch_norm(x, training=training)
+        x = self.dropout(x, training=training)
+        # [Output Dense Layer]
+        return self.output_dense(x)
+
+# -----------------------------------------------------------------------------
+# Custom Learning Rate Scheduler Callback
+# -----------------------------------------------------------------------------
+
+class CustomLearningRateScheduler(tf.keras.callbacks.Callback):
+    """
+    Custom callback to adjust learning rate dynamically:
+    new_lr = initial_lr * (decay_factor)^(epoch / decay_steps)
+    """
+    def __init__(self, initial_lr, decay_factor, decay_steps):
+        super(CustomLearningRateScheduler, self).__init__()
+        self.initial_lr = initial_lr
+        self.decay_factor = decay_factor
+        self.decay_steps = decay_steps
+
+    def on_epoch_begin(self, epoch, logs=None):
+        new_lr = self.initial_lr * (self.decay_factor ** (epoch / self.decay_steps))
+        tf.keras.backend.set_value(self.model.optimizer.lr, new_lr)
+        print(f"[Epoch {epoch+1}] Setting learning rate to: {new_lr:.6f}")
+
+# -----------------------------------------------------------------------------
+# Synthetic Data Generation and Preprocessing
+# -----------------------------------------------------------------------------
+
+def generate_synthetic_data(num_samples=30000, input_dim=64, num_classes=10):
+    """
+    Generates synthetic training data.
+      - X: Random float32 values.
+      - y: Random integers turned into one-hot encoded labels.
+    """
+    np.random.seed(42)
+    X = np.random.rand(num_samples, input_dim).astype(np.float32)
+    y_int = np.random.randint(0, num_classes, size=(num_samples,))
+    y = tf.keras.utils.to_categorical(y_int, num_classes)
+    return X, y
+
+def prepare_distributed_dataset(X, y, batch_size, strategy):
+    """
+    Prepares a distributed tf.data.Dataset:
+        • Constructs dataset from synthetic data.
+        • Applies shuffling, batching, and prefetching.
+        • Converts to distributed dataset via strategy.experimental_distribute_dataset.
+    """
+    dataset = tf.data.Dataset.from_tensor_slices((X, y))
+    dataset = dataset.shuffle(buffer_size=10000)
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    # Convert to a distributed dataset for multi-device training.
+    dist_dataset = strategy.experimental_distribute_dataset(dataset)
+    return dist_dataset
+
+# -----------------------------------------------------------------------------
+# Custom Training Loop (Optional Alternative)
+# -----------------------------------------------------------------------------
+
+def custom_train_loop(model, optimizer, loss_fn, dist_dataset, epochs, strategy, log_interval=100):
+    """
+    Implements a custom training loop with tf.GradientTape in a distributed setting.
+    """
+    train_loss = tf.keras.metrics.Mean(name="train_loss")
+    train_acc = tf.keras.metrics.CategoricalAccuracy(name="train_accuracy")
+
+    # Distributed training step
+    @tf.function
+    def train_step(inputs):
+        x_batch, y_batch = inputs
+        with tf.GradientTape() as tape:
+            predictions = model(x_batch, training=True)
+            loss = loss_fn(y_batch, predictions)
+            # Include regularization losses
+            loss += tf.add_n(model.losses)
+        gradients = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        train_loss.update_state(loss)
+        train_acc.update_state(y_batch, predictions)
+
+    for epoch in range(epochs):
+        train_loss.reset_states()
+        train_acc.reset_states()
+        step = 0
+        for batch in dist_dataset:
+            strategy.run(train_step, args=(batch,))
+            if step % log_interval == 0:
+                print(f"Epoch {epoch+1}, step {step}, loss: {train_loss.result().numpy():.4f}, acc: {train_acc.result().numpy():.4f}")
+            step += 1
+        print(f"Epoch {epoch+1} completed. Loss: {train_loss.result().numpy():.4f}, Accuracy: {train_acc.result().numpy():.4f}")
+
+# -----------------------------------------------------------------------------
+# Main Execution Flow: Building, Training, and Deploying the Model
+# -----------------------------------------------------------------------------
+
+def main():
+    # --------------------------------------------------------------------------------
+    # Configuration & Hyperparameters
+    # --------------------------------------------------------------------------------
+    INPUT_DIM = 64
+    NUM_CLASSES = 10
+    BATCH_SIZE = 128
+    EPOCHS = 30
+    INITIAL_LR = 1e-3
+    DECAY_FACTOR = 0.9
+    DECAY_STEPS = 5
+
+    # --------------------------------------------------------------------------------
+    # Step 1: Data Generation (Mind Map: [Data Generation] → [Synthetic Dataset])
+    # --------------------------------------------------------------------------------
+    X, y = generate_synthetic_data(num_samples=30000, input_dim=INPUT_DIM, num_classes=NUM_CLASSES)
+    print(f"Generated synthetic data: X.shape={X.shape}, y.shape={y.shape}")
+
+    # --------------------------------------------------------------------------------
+    # Step 2: Distributed Strategy and Dataset Preparation
+    #         (Mind Map: [Distributed Strategy Scope] + [Distributed Dataset Preparation])
+    # --------------------------------------------------------------------------------
+    strategy = tf.distribute.MirroredStrategy()
+    print("Distributed strategy in use:", strategy.__class__.__name__)
+
+    # Prepare the distributed dataset
+    dist_dataset = prepare_distributed_dataset(X, y, BATCH_SIZE, strategy)
+
+    # --------------------------------------------------------------------------------
+    # Step 3: Complex Model Instantiation Within the Distributed Strategy Scope
+    #         (Mind Map: [ComplexModel Instantiation] and its branches)
+    # --------------------------------------------------------------------------------
+    with strategy.scope():
+        model = ComplexModel(input_dim=INPUT_DIM, output_dim=NUM_CLASSES,
+                             hidden_units=[128, 256, 128],
+                             num_residual_blocks=4,
+                             dropout_rate=0.3)
+        optimizer = tf.keras.optimizers.Adam(learning_rate=INITIAL_LR)
+        loss_fn = tf.keras.losses.CategoricalCrossentropy()
+        # Compile the model for high-level training via model.fit()
+        model.compile(optimizer=optimizer, loss=loss_fn, metrics=['accuracy'])
+        # Build model with an input shape (for summary visualization)
+        model.build(input_shape=(None, INPUT_DIM))
+        print("Model Summary:")
+        model.summary()
+
+    # --------------------------------------------------------------------------------
+    # Step 4: Callbacks Setup
+    #         (Mind Map: [Callbacks: TensorBoard Callback, CustomLR Scheduler Callback])
+    # --------------------------------------------------------------------------------
+    log_dir = os.path.join("logs", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
+    lr_scheduler_cb = CustomLearningRateScheduler(initial_lr=INITIAL_LR,
+                                                  decay_factor=DECAY_FACTOR,
+                                                  decay_steps=DECAY_STEPS)
+    callbacks = [tensorboard_cb, lr_scheduler_cb]
+
+    # --------------------------------------------------------------------------------
+    # Step 5: Training Phase
+    #         (Mind Map: [Training Phase] → Either use model.fit() OR a custom training loop)
+    # --------------------------------------------------------------------------------
+    use_custom_loop = False  # Set True to use the custom training loop instead of model.fit()
+
+    if not use_custom_loop:
+        # Training with high-level model.fit() using the distributed dataset
+        print("Training using model.fit() with Distributed Dataset...")
+        history = model.fit(dist_dataset, epochs=EPOCHS, callbacks=callbacks)
+    else:
+        # Alternatively, use the explicitly defined custom training loop (comment out if not needed)
+        print("Training using custom training loop with tf.GradientTape...")
+        custom_train_loop(model, optimizer, loss_fn, dist_dataset, EPOCHS, strategy)
+
+    # --------------------------------------------------------------------------------
+    # Step 6: Model Evaluation, Saving, and Post-Training Analysis
+    #         (Mind Map: [Model Evaluation & Validation] → [Model Saving & Logging] → [Post-Training Analysis])
+    # --------------------------------------------------------------------------------
+    # Evaluate the model (using the same dataset here for demonstration)
+    evaluation = model.evaluate(dist_dataset)
+    print(f"Evaluation Results: {evaluation}")
+
+    # Save the model architecture and weights
+    model_save_path = "complex_model_distributed.h5"
+    model.save(model_save_path)
+    print(f"Model saved successfully to {model_save_path}")
+
+    # --------------------------------------------------------------------------------
+    # Step 7: (Optional) Deployment Conversion: Export to TF Lite
+    # --------------------------------------------------------------------------------
+    try:
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        tflite_model = converter.convert()
+        with open("complex_model_distributed.tflite", "wb") as f:
+            f.write(tflite_model)
+        print("TF Lite model conversion successful.")
+    except Exception as e:
+        print("TF Lite conversion failed:", e)
+
+    # Additional post-training analysis or debugging tools can be inserted here.
+
+if __name__ == "__main__":
+    main()
