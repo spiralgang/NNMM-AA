@@ -1,0 +1,71 @@
+[Main Execution]
+                                                    │
+                ┌───────────────────────────────────┴───────────────────────────────────┐
+                │                                                                   │
+         [Data Generation]                                                [Distributed Strategy Scope]
+                │                                                                   │
+                ▼                                                                   ▼
+       [Synthetic Dataset]                           ┌─────────────────────────────────────────────┐
+                │                                  │          [ComplexModel Instantiation]         │
+                ▼                                  │                 ┌─────┐                       │
+         [tf.data.Dataset]                         │       ┌─────────┴───────────┐                   │
+                │                                  │       │                     │                   │
+                ▼                                  │ [Input Dense Layer]    [Hidden Layers Array]         │
+      [Shuffling, Batching,                          │      (CustomDense)             │                   │
+         Prefetching]                           │             │                 │                   │
+                │                                  │             ▼                 ▼                   │
+                ▼                                  │     [Residual Blocks (Repeated)] (ResidualBlock Layers) │
+   [Distributed Dataset Preparation]                │                     │                                   │
+      (e.g., strategy.experimental_distribute_dataset)│                     ▼                                   │
+                │                                  │         [BatchNorm & Dropout Layers]                       │
+                └────────────────────────────────────┼────────────────────┬─────────────────────────────┘
+                                                     │                    │
+                                                     ▼                    ▼
+                                            [Output Dense Layer (softmax)]
+                                                     │
+                                                     ▼
+                                            [Model Compilation]
+                                                     │
+                              ┌──────────────────────┴──────────────────────┐
+                              │                                             │
+                [Optimizer, Loss, & Metrics]                      [Callbacks Setup]
+                              │                                             │
+                              │                         ┌─────────────────────────────┐
+                              │                         │ [TensorBoard Callback]      │
+                              │                         └─────────────────────────────┘
+                              │                                             │
+                              │                         ┌─────────────────────────────┐
+                              │                         │ [CustomLR Scheduler Callback] │
+                              │                         └─────────────────────────────┘
+                              └──────────────────────┬───────────────────────────────┘
+                                                     │
+                                                     ▼
+                                                [Training Phase]
+                                                     │
+                                                     ▼
+                           ┌─────────────────────────┴─────────────────────────┐
+                           │                                                   │
+            [High-Level model.fit() with Distributed Dataset]      [Custom Training Loop using tf.GradientTape]
+                           │                                                   │
+                           └─────────────────────────┬─────────────────────────┘
+                                                     │
+                                                     ▼
+                                          [Model Evaluation & Validation]
+                                                     │
+                                                     ▼
+                                         [Model Saving & Logging]
+                                                     │
+                                                     ▼
+                                          [Post-Training Analysis]
+                                                     │
+              ┌─────────────────────────────────────────┴──────────────────────────────────────────┐
+              │                                                                                          │
+   [Deployment: Export as SavedModel]                                                   [Deployment: Convert to TF Lite/ONNX]
+              │                                                                                          │
+              ▼                                                                                          ▼
+   [Integration in Production Environments]                                      [Performance Profiling & Optimization]
+              │                                                                                          │
+              └─────────────────────────────────────────┬──────────────────────────────────────────┘
+                                                     │
+                                                     ▼
+                                  [Further Analysis & Debugging Tools]
